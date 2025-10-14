@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Apogee Retailer Monitor - Enhanced Version with Better Error Handling
+Apogee Retailer Monitor - Fixed Version with Better Parsing
 """
 
 import os
@@ -15,6 +15,7 @@ import sys
 from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse
 from pathlib import Path
+from datetime import datetime
 
 import pandas as pd
 import gspread
@@ -61,7 +62,11 @@ def _safe_float(x: Any) -> Optional[float]:
         if x is None:
             return None
         s = str(x).replace(",", "").strip()
-        return float(s)
+        val = float(s)
+        # Sanity check for ratings (should be 0-5)
+        if val > 5.0:
+            return None
+        return val
     except Exception:
         return None
 
@@ -153,7 +158,6 @@ def fetch_with_requests(url: str, config: Dict) -> tuple[str, int]:
         if response.status_code >= 400:
             return "", response.status_code
         
-        # Check for bot detection
         html = response.text
         if len(html) < 500 or any(x in html.lower() for x in ["cloudflare", "captcha", "access denied", "checking your browser"]):
             return "", response.status_code
@@ -164,7 +168,7 @@ def fetch_with_requests(url: str, config: Dict) -> tuple[str, int]:
         return "", 0
 
 def fetch_with_playwright(url: str, config: Dict):
-    """Fetch page with Playwright browser - returns (html, status, playwright_obj, page_obj)"""
+    """Fetch page with Playwright browser"""
     if not HAVE_PW:
         return "", 0, None, None
     
@@ -188,23 +192,20 @@ def fetch_with_playwright(url: str, config: Dict):
         
         page = context.new_page()
         
-        # Stealth
         page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
             Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
         """)
         
-        # Block unnecessary resources
         page.route("**/*", lambda route, request:
             route.abort() if request.resource_type in ("image", "media", "font")
             else route.continue_()
         )
         
-        # Navigate
         timeout_ms = int(config["SCRAPE_TIMEOUT"] * 1000)
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(2000)  # Increased wait for JS
         
         html = page.content()
         return html, 200, p, (browser, context, page)
@@ -235,6 +236,67 @@ def close_playwright(p, handles):
         pass
 
 # --------------------------------------------------------------------------------------
+# Parsing - FIXED REGEX PATTERNS
+# --------------------------------------------------------------------------------------
+
+def extract_rating_and_count(text: str) -> Dict[str, Any]:
+    """
+    Extract rating and count with STRICT patterns to avoid false matches.
+    
+    CRITICAL: Rating must come BEFORE count to avoid parsing count as rating.
+    """
+    result = {"avg_rating": None, "total_ratings": None, "review_count": None}
+    
+    # Pattern 1: "4.5 out of 5" or "4.5 out of 5 stars" (most specific)
+    rating_match = re.search(r'\b(\d+(?:\.\d+)?)\s+out\s+of\s+5', text, re.I)
+    if rating_match:
+        rating = _safe_float(rating_match.group(1))
+        if rating and rating <= 5.0:
+            result["avg_rating"] = rating
+            log.debug(f"Found rating via 'X out of 5': {rating}")
+    
+    # Pattern 2: "4.5/5" or "4.5 / 5"
+    if not result["avg_rating"]:
+        rating_match = re.search(r'\b(\d+(?:\.\d+)?)\s*/\s*5\b', text, re.I)
+        if rating_match:
+            rating = _safe_float(rating_match.group(1))
+            if rating and rating <= 5.0:
+                result["avg_rating"] = rating
+                log.debug(f"Found rating via 'X/5': {rating}")
+    
+    # Pattern 3: Star rating in specific contexts (be very careful)
+    if not result["avg_rating"]:
+        # Look for patterns like "Rating: 4.5" or "4.5 stars"
+        rating_match = re.search(r'\b(?:rating|rated|score):\s*(\d+(?:\.\d+)?)', text, re.I)
+        if rating_match:
+            rating = _safe_float(rating_match.group(1))
+            if rating and rating <= 5.0:
+                result["avg_rating"] = rating
+                log.debug(f"Found rating via 'Rating: X': {rating}")
+    
+    # Count patterns - look for explicit review/rating counts
+    # Pattern 1: "(123 reviews)" or "(123 ratings)"
+    count_match = re.search(r'\((\d+(?:,\d+)?)\s+(?:review|rating)s?\)', text, re.I)
+    if count_match:
+        count = _safe_int(count_match.group(1))
+        if count:
+            result["total_ratings"] = count
+            result["review_count"] = count
+            log.debug(f"Found count via '(X reviews)': {count}")
+    
+    # Pattern 2: "123 reviews" or "123 ratings" (not in parentheses)
+    if not result["total_ratings"]:
+        count_match = re.search(r'\b(\d+(?:,\d+)?)\s+(?:review|rating)s?\b', text, re.I)
+        if count_match:
+            count = _safe_int(count_match.group(1))
+            if count:
+                result["total_ratings"] = count
+                result["review_count"] = count
+                log.debug(f"Found count via 'X reviews': {count}")
+    
+    return result
+
+# --------------------------------------------------------------------------------------
 # Parsing - JSON-LD
 # --------------------------------------------------------------------------------------
 
@@ -255,10 +317,13 @@ def extract_jsonld(soup: BeautifulSoup) -> Dict[str, Any]:
                 if not isinstance(item, dict):
                     continue
                 
+                # Check for Product with aggregateRating
                 agg = item.get("aggregateRating", {})
                 if isinstance(agg, dict):
                     if agg.get("ratingValue"):
-                        result["avg_rating"] = _safe_float(agg.get("ratingValue"))
+                        rating = _safe_float(agg.get("ratingValue"))
+                        if rating and rating <= 5.0:
+                            result["avg_rating"] = rating
                     
                     count = agg.get("ratingCount") or agg.get("reviewCount")
                     if count:
@@ -273,64 +338,56 @@ def extract_jsonld(soup: BeautifulSoup) -> Dict[str, Any]:
             log.debug(f"JSON-LD parse error: {e}")
             continue
     
-    return result
-
-# --------------------------------------------------------------------------------------
-# Parsing - Retailer-specific
-# --------------------------------------------------------------------------------------
-
-def parse_rating_text(text: str) -> Dict[str, Any]:
-    """Extract rating and count from text using regex"""
-    result = {"avg_rating": None, "total_ratings": None, "review_count": None}
-    
-    rating_match = re.search(r"(\d+\.?\d*)\s*(?:out of|\/)\s*5", text, re.I)
-    if rating_match:
-        result["avg_rating"] = _safe_float(rating_match.group(1))
-    
-    count_match = re.search(r"(\d+(?:,\d+)?)\s*(?:review|rating)", text, re.I)
-    if count_match:
-        count = _safe_int(count_match.group(1))
-        result["total_ratings"] = count
-        result["review_count"] = count
+    if result["avg_rating"] or result["total_ratings"]:
+        log.debug(f"JSON-LD found: rating={result['avg_rating']}, count={result['total_ratings']}")
     
     return result
 
-def wait_for_element(page, selectors: List[str], max_attempts: int = 10):
-    """Wait for any of the given selectors to appear"""
-    for _ in range(max_attempts):
+# --------------------------------------------------------------------------------------
+# Parsing - Retailer-specific with Playwright
+# --------------------------------------------------------------------------------------
+
+def wait_for_element(page, selectors: List[str], max_attempts: int = 15):
+    """Wait for any selector to appear - increased attempts"""
+    for attempt in range(max_attempts):
         for sel in selectors:
             try:
                 el = page.locator(sel).first
                 if el.count() > 0 and el.is_visible():
+                    log.debug(f"Found element with selector: {sel}")
                     return el
             except:
                 pass
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(300)
     return None
 
 def parse_sweetwater(page_or_html) -> Dict[str, Any]:
-    """Parse Sweetwater product page"""
+    """Parse Sweetwater - they use data attributes"""
     if hasattr(page_or_html, 'content'):
         page = page_or_html
         
+        # Try clicking reviews tab
         try:
-            tab = page.locator("text=/reviews/i").first
-            if tab.count() > 0:
-                tab.click()
-                page.wait_for_timeout(1000)
+            tabs = page.locator("button, a").filter(has_text=re.compile(r"reviews?", re.I))
+            if tabs.count() > 0:
+                tabs.first.click()
+                page.wait_for_timeout(1500)
+                log.debug("Clicked reviews tab")
         except:
             pass
         
+        # Look for rating summary
         el = wait_for_element(page, [
             "[data-qa='rating-summary']",
-            ".review-summary",
-            ".rating-summary",
-            "[class*='review'][class*='summary']"
+            "[class*='rating-summary']",
+            "[class*='review-summary']",
+            ".sw-rating-stars",
+            "[aria-label*='rating']"
         ])
         
         if el:
             html = el.inner_html()
-            result = parse_rating_text(html)
+            result = extract_rating_and_count(html)
             if result["avg_rating"] or result["total_ratings"]:
                 return result
         
@@ -342,26 +399,36 @@ def parse_sweetwater(page_or_html) -> Dict[str, Any]:
     result = extract_jsonld(soup)
     
     if not (result["avg_rating"] or result["total_ratings"]):
-        text_result = parse_rating_text(html)
-        result.update(text_result)
+        result.update(extract_rating_and_count(html))
     
     return result
 
 def parse_guitarcenter(page_or_html) -> Dict[str, Any]:
-    """Parse Guitar Center product page"""
+    """Parse Guitar Center - uses Bazaarvoice reviews"""
     if hasattr(page_or_html, 'content'):
         page = page_or_html
         
+        # Scroll to reviews section to trigger JS
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+            page.wait_for_timeout(2000)
+        except:
+            pass
+        
+        # GC uses BV (Bazaarvoice) components
         el = wait_for_element(page, [
             "[class*='BVRRRatingSummary']",
             "[id*='BVRRSummaryContainer']",
-            ".pr-snippet",
-            "[class*='review'][class*='summary']"
+            "[class*='bv-rating-summary']",
+            "[class*='pr-snippet']",
+            ".bv_avgRating_component_container",
+            "[data-bv-show='rating_summary']"
         ])
         
         if el:
             html = el.inner_html()
-            result = parse_rating_text(html)
+            log.debug(f"GC rating HTML snippet: {html[:200]}")
+            result = extract_rating_and_count(html)
             if result["avg_rating"] or result["total_ratings"]:
                 return result
         
@@ -369,28 +436,40 @@ def parse_guitarcenter(page_or_html) -> Dict[str, Any]:
     else:
         html = page_or_html
     
+    # Save snippet for debugging
+    log.debug(f"GC full HTML length: {len(html)}")
+    
     soup = BeautifulSoup(html, "lxml")
     result = extract_jsonld(soup)
     
     if not (result["avg_rating"] or result["total_ratings"]):
-        result.update(parse_rating_text(html))
+        result.update(extract_rating_and_count(html))
     
     return result
 
 def parse_bh(page_or_html) -> Dict[str, Any]:
-    """Parse B&H Photo product page"""
+    """Parse B&H Photo"""
     if hasattr(page_or_html, 'content'):
         page = page_or_html
+        
+        # Scroll to reviews
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+            page.wait_for_timeout(1500)
+        except:
+            pass
         
         el = wait_for_element(page, [
             "[data-selenium='reviewSummary']",
             "[data-selenium='ratingSummary']",
+            "[class*='review-summary']",
             ".bv_avgRating_component_container",
-            "[class*='review']"
+            "[class*='pr-snippet']"
         ])
         
         if el:
-            result = parse_rating_text(el.inner_html())
+            html = el.inner_html()
+            result = extract_rating_and_count(html)
             if result["avg_rating"] or result["total_ratings"]:
                 return result
         
@@ -402,12 +481,12 @@ def parse_bh(page_or_html) -> Dict[str, Any]:
     result = extract_jsonld(soup)
     
     if not (result["avg_rating"] or result["total_ratings"]):
-        result.update(parse_rating_text(html))
+        result.update(extract_rating_and_count(html))
     
     return result
 
 def parse_vintageking(page_or_html) -> Dict[str, Any]:
-    """Parse Vintage King product page"""
+    """Parse Vintage King"""
     if hasattr(page_or_html, 'content'):
         page = page_or_html
         html = page.content()
@@ -418,23 +497,32 @@ def parse_vintageking(page_or_html) -> Dict[str, Any]:
     result = extract_jsonld(soup)
     
     if not (result["avg_rating"] or result["total_ratings"]):
-        result.update(parse_rating_text(html))
+        # Look for specific VK elements
+        rating_divs = soup.find_all(['div', 'span'], class_=re.compile(r'rating|review', re.I))
+        for div in rating_divs[:5]:  # Check first 5
+            text = div.get_text()
+            parsed = extract_rating_and_count(text)
+            if parsed["avg_rating"] or parsed["total_ratings"]:
+                result.update(parsed)
+                break
     
     return result
 
 def parse_thomann(page_or_html) -> Dict[str, Any]:
-    """Parse Thomann product page"""
+    """Parse Thomann"""
     if hasattr(page_or_html, 'content'):
         page = page_or_html
         
         el = wait_for_element(page, [
             "[class*='rating']",
             "[class*='review']",
-            "a[href*='reviews']"
+            "a[href*='reviews']",
+            "[data-testing-id*='rating']"
         ])
         
         if el:
-            result = parse_rating_text(el.inner_html())
+            html = el.inner_html()
+            result = extract_rating_and_count(html)
             if result["avg_rating"] or result["total_ratings"]:
                 return result
         
@@ -446,12 +534,12 @@ def parse_thomann(page_or_html) -> Dict[str, Any]:
     result = extract_jsonld(soup)
     
     if not (result["avg_rating"] or result["total_ratings"]):
-        result.update(parse_rating_text(html))
+        result.update(extract_rating_and_count(html))
     
     return result
 
 def parse_apple(page_or_html) -> Dict[str, Any]:
-    """Parse Apple App Store page"""
+    """Parse Apple App Store"""
     if hasattr(page_or_html, 'content'):
         html = page_or_html.content()
     else:
@@ -461,12 +549,12 @@ def parse_apple(page_or_html) -> Dict[str, Any]:
     result = extract_jsonld(soup)
     
     if not (result["avg_rating"] or result["total_ratings"]):
-        result.update(parse_rating_text(html))
+        result.update(extract_rating_and_count(html))
     
     return result
 
 def parse_yelp(page_or_html) -> Dict[str, Any]:
-    """Parse Yelp business page"""
+    """Parse Yelp"""
     if hasattr(page_or_html, 'content'):
         html = page_or_html.content()
     else:
@@ -476,7 +564,7 @@ def parse_yelp(page_or_html) -> Dict[str, Any]:
     result = extract_jsonld(soup)
     
     if not (result["avg_rating"] or result["total_ratings"]):
-        result.update(parse_rating_text(html))
+        result.update(extract_rating_and_count(html))
     
     return result
 
@@ -522,29 +610,34 @@ def scrape_product(url: str, config: Dict, retailer: str, product: str) -> Dict[
     log.debug(f"  URL: {url}")
     log.debug(f"  Mode: {'Playwright' if use_pw else 'Requests'}")
     
+    # Try with Playwright if enabled
     if use_pw and parser:
         html, code, p, handles = fetch_with_playwright(url, config)
+        result = {}
         try:
             if handles:
                 _, _, page = handles
                 result = parser(page)
                 
                 if result.get("avg_rating") or result.get("total_ratings"):
-                    log.info(f"  ✓ Found: {result['avg_rating']} stars, {result['total_ratings']} reviews")
+                    log.info(f"  ✓ Found: rating={result.get('avg_rating')}, reviews={result.get('total_ratings')}")
                     return result
             
+            # Fallback to JSON-LD on rendered HTML
             if html:
                 soup = BeautifulSoup(html, "lxml")
                 result = extract_jsonld(soup)
                 if result.get("avg_rating") or result.get("total_ratings"):
-                    log.info(f"  ✓ Found via JSON-LD: {result['avg_rating']} stars")
+                    log.info(f"  ✓ Found via JSON-LD: {result.get('avg_rating')} stars")
                     return result
         finally:
+            # Save artifact if debugging and nothing found
             if config["DEBUG_ARTIFACTS"] and html:
                 if not (result.get("avg_rating") or result.get("total_ratings")):
                     save_artifact(html, retailer, product)
             close_playwright(p, handles)
     
+    # Try with requests
     else:
         html, code = fetch_with_requests(url, config)
         
@@ -553,18 +646,20 @@ def scrape_product(url: str, config: Dict, retailer: str, product: str) -> Dict[
             result = extract_jsonld(soup)
             
             if result.get("avg_rating") or result.get("total_ratings"):
-                log.info(f"  ✓ Found: {result['avg_rating']} stars, {result['total_ratings']} reviews")
+                log.info(f"  ✓ Found: {result.get('avg_rating')} stars, {result.get('total_ratings')} reviews")
                 return result
             
             if parser:
                 result = parser(html)
                 if result.get("avg_rating") or result.get("total_ratings"):
-                    log.info(f"  ✓ Found: {result['avg_rating']} stars")
+                    log.info(f"  ✓ Found: {result.get('avg_rating')} stars")
                     return result
         
+        # Fallback to Playwright
         if HAVE_PW:
             log.debug("  Falling back to Playwright...")
             html, code, p, handles = fetch_with_playwright(url, config)
+            result = {}
             try:
                 if html:
                     if parser and handles:
@@ -575,7 +670,7 @@ def scrape_product(url: str, config: Dict, retailer: str, product: str) -> Dict[
                         result = extract_jsonld(soup)
                     
                     if result.get("avg_rating") or result.get("total_ratings"):
-                        log.info(f"  ✓ Found: {result['avg_rating']} stars")
+                        log.info(f"  ✓ Found: {result.get('avg_rating')} stars")
                         return result
             finally:
                 if config["DEBUG_ARTIFACTS"] and html:
@@ -591,7 +686,8 @@ def save_artifact(html: str, retailer: str, product: str):
         artifact_dir = Path("/tmp/artifacts")
         artifact_dir.mkdir(parents=True, exist_ok=True)
         
-        filename = f"{slugify(retailer)}__{slugify(product)}.html"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{slugify(retailer)}__{slugify(product)}__{timestamp}.html"
         filepath = artifact_dir / filename
         
         filepath.write_text(html, encoding="utf-8", errors="ignore")
@@ -600,81 +696,51 @@ def save_artifact(html: str, retailer: str, product: str):
         log.warning(f"Failed to save artifact: {e}")
 
 # --------------------------------------------------------------------------------------
-# Google Sheets - IMPROVED ERROR HANDLING
+# Google Sheets
 # --------------------------------------------------------------------------------------
 
 def connect_sheets() -> tuple[gspread.Client, gspread.Spreadsheet]:
     """Connect to Google Sheets with detailed error messages"""
     log.info("Attempting to connect to Google Sheets...")
     
-    # Check if secret exists
     sa_json = os.getenv("GOOGLE_SA_JSON", "")
     
-    log.info(f"GOOGLE_SA_JSON environment variable status:")
-    log.info(f"  - Exists: {bool(sa_json)}")
-    log.info(f"  - Length: {len(sa_json) if sa_json else 0} characters")
-    
     if not sa_json:
-        log.error("❌ GOOGLE_SA_JSON is not set or is empty!")
-        log.error("Please check:")
-        log.error("  1. GitHub repo → Settings → Secrets → Actions")
-        log.error("  2. Verify 'GOOGLE_SA_JSON' secret exists")
-        log.error("  3. Make sure you pasted the ENTIRE JSON file contents")
+        log.error("❌ GOOGLE_SA_JSON is not set!")
         sys.exit(1)
     
-    # Try to parse JSON
     try:
-        log.info("Attempting to parse GOOGLE_SA_JSON as JSON...")
         creds = json.loads(sa_json)
         log.info("✓ Successfully parsed JSON")
         
-        # Validate it looks like a service account
-        if "type" not in creds:
-            log.error("❌ JSON doesn't have 'type' field - not a valid service account JSON")
-            sys.exit(1)
-        
         if creds.get("type") != "service_account":
-            log.error(f"❌ JSON type is '{creds.get('type')}' but should be 'service_account'")
+            log.error(f"❌ Invalid service account type")
             sys.exit(1)
         
-        log.info(f"✓ Service account email: {creds.get('client_email', 'NOT FOUND')}")
+        log.info(f"✓ Service account: {creds.get('client_email', 'UNKNOWN')}")
         
     except json.JSONDecodeError as e:
-        log.error("❌ GOOGLE_SA_JSON is not valid JSON!")
-        log.error(f"JSON parsing error: {e}")
-        log.error("Make sure you copied the ENTIRE JSON file, including { and }")
+        log.error(f"❌ Invalid JSON: {e}")
         sys.exit(1)
     
-    # Try to authenticate
     try:
-        log.info("Authenticating with Google Sheets API...")
         gc = gspread.service_account_from_dict(creds)
-        log.info("✓ Successfully authenticated")
+        log.info("✓ Authenticated with Google")
     except Exception as e:
-        log.error(f"❌ Failed to authenticate: {e}")
+        log.error(f"❌ Auth failed: {e}")
         sys.exit(1)
     
-    # Get sheet ID
     sheet_id = os.getenv("SHEET_ID", "")
-    log.info(f"SHEET_ID: {sheet_id if sheet_id else 'NOT SET'}")
-    
     if not sheet_id:
-        log.error("❌ SHEET_ID is not set!")
-        log.error("Please add SHEET_ID to GitHub secrets")
+        log.error("❌ SHEET_ID not set")
         sys.exit(1)
     
-    # Try to open sheet
     try:
-        log.info(f"Opening spreadsheet: {sheet_id}")
         ss = gc.open_by_key(sheet_id)
-        log.info(f"✓ Successfully opened sheet: {ss.title}")
+        log.info(f"✓ Opened sheet: {ss.title}")
         return gc, ss
     except Exception as e:
-        log.error(f"❌ Failed to open spreadsheet: {e}")
-        log.error("Please check:")
-        log.error(f"  1. Sheet ID is correct: {sheet_id}")
-        log.error(f"  2. Service account email has Editor access to the sheet")
-        log.error(f"     Email: {creds.get('client_email')}")
+        log.error(f"❌ Failed to open sheet: {e}")
         sys.exit(1)
 
 def read_input(ss: gspread.Spreadsheet) -> pd.DataFrame:
@@ -684,21 +750,17 @@ def read_input(ss: gspread.Spreadsheet) -> pd.DataFrame:
     try:
         ws = ss.worksheet(input_tab)
     except Exception as e:
-        log.error(f"❌ Could not find '{input_tab}' tab in spreadsheet")
-        log.error(f"Error: {e}")
-        log.error(f"Available sheets: {[ws.title for ws in ss.worksheets()]}")
+        log.error(f"❌ Could not find '{input_tab}' tab")
         sys.exit(1)
     
     df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
     df = df.dropna(how="all", axis=0).dropna(how="all", axis=1)
     
-    # Validate columns
     required = ["retailer", "product_name", "url"]
     missing = [col for col in required if col not in df.columns]
     
     if missing:
-        log.error(f"❌ Input sheet missing required columns: {missing}")
-        log.error(f"Found columns: {list(df.columns)}")
+        log.error(f"❌ Missing columns: {missing}")
         sys.exit(1)
     
     return df
@@ -710,7 +772,7 @@ def write_results(ss: gspread.Spreadsheet, results: List[Dict]):
     try:
         ws = ss.worksheet(output_tab)
     except:
-        log.info(f"Creating new sheet: {output_tab}")
+        log.info(f"Creating sheet: {output_tab}")
         ws = ss.add_worksheet(output_tab, rows=1000, cols=20)
     
     existing = get_as_dataframe(ws, evaluate_formulas=False, header=0)
@@ -749,20 +811,20 @@ def write_results(ss: gspread.Spreadsheet, results: List[Dict]):
 def main():
     """Main execution"""
     log.info("=" * 70)
-    log.info("Apogee Retailer Monitor Starting")
+    log.info("Apogee Retailer Monitor - FIXED VERSION")
     log.info("=" * 70)
     
     config = load_config()
     log.info(f"Configuration:")
     for key, value in config.items():
-        if key not in ["USER_AGENT"]:  # Don't log long UA string
+        if key not in ["USER_AGENT"]:
             log.info(f"  {key}: {value}")
     
     gc, ss = connect_sheets()
     
-    log.info("Reading input data...")
+    log.info("Reading input...")
     df = read_input(ss)
-    log.info(f"Total products in sheet: {len(df)}")
+    log.info(f"Total products: {len(df)}")
     
     retailer_filter = config["RETAILER_FILTER"]
     if retailer_filter:
@@ -770,7 +832,7 @@ def main():
         log.info(f"Filtered to '{retailer_filter}': {len(df)} products")
     
     if df.empty:
-        log.warning("No products to process. Exiting.")
+        log.warning("No products to process")
         return
     
     results = []
@@ -819,11 +881,11 @@ def main():
                     "product_name": product,
                     "url": url,
                     "status": "error",
-                    "notes": "No rating data found"
+                    "notes": "No rating data found - check artifacts"
                 })
         
         except Exception as e:
-            log.exception(f"Error processing {retailer}/{product}")
+            log.exception(f"Error: {retailer}/{product}")
             results.append({
                 "retailer": retailer,
                 "product_name": product,
@@ -833,7 +895,7 @@ def main():
             })
     
     if results:
-        log.info("Writing results to sheet...")
+        log.info("Writing results...")
         write_results(ss, results)
     
     success = sum(1 for r in results if r["status"] == "ok")
