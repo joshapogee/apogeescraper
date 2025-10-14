@@ -1,0 +1,121 @@
+name: Retailer Monitor - Weekly
+
+on:
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      retailer:
+        description: 'Specific retailer to run (leave empty for all)'
+        required: false
+        type: string
+  
+  # Weekly schedule - Mondays at 2pm UTC (6am PT / 9am ET)
+  schedule:
+    - cron: "0 14 * * MON"
+
+jobs:
+  scrape-retailers:
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    
+    strategy:
+      fail-fast: false
+      max-parallel: 3  # Don't hammer all retailers at once
+      
+      matrix:
+        include:
+          # Apple (App Store - usually fast)
+          - retailer: "Apple"
+            use_playwright: "0"
+            request_delay: "2.5"
+            scrape_timeout: "60"
+          
+          # Sweetwater (needs Playwright)
+          - retailer: "Sweetwater"
+            use_playwright: "1"
+            request_delay: "4.0"
+            scrape_timeout: "90"
+          
+          # Guitar Center (needs Playwright)
+          - retailer: "GC"
+            use_playwright: "1"
+            request_delay: "4.5"
+            scrape_timeout: "110"
+          
+          # B&H Photo (needs Playwright)
+          - retailer: "BH"
+            use_playwright: "1"
+            request_delay: "5.0"
+            scrape_timeout: "120"
+          
+          # Vintage King (usually works with requests)
+          - retailer: "Vintage King"
+            use_playwright: "0"
+            request_delay: "3.0"
+            scrape_timeout: "70"
+          
+          # Thomann (usually works with requests)
+          - retailer: "Thomann"
+            use_playwright: "0"
+            request_delay: "3.0"
+            scrape_timeout: "70"
+          
+          # Yelp (may need Playwright)
+          - retailer: "Yelp"
+            use_playwright: "1"
+            request_delay: "4.0"
+            scrape_timeout: "90"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Install Playwright browsers
+        if: matrix.use_playwright == '1'
+        run: |
+          python -m playwright install --with-deps chromium
+      
+      - name: Run scraper
+        env:
+          # Secrets
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          
+          # Retailer filter
+          RETAILER_FILTER: ${{ github.event.inputs.retailer || matrix.retailer }}
+          
+          # Settings from matrix
+          USE_PLAYWRIGHT: ${{ matrix.use_playwright }}
+          SCRAPE_TIMEOUT: ${{ matrix.scrape_timeout }}
+          REQUEST_DELAY: ${{ matrix.request_delay }}
+          
+          # General settings
+          USER_AGENT: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          JITTER: "0.8"
+          LOG_LEVEL: "INFO"
+          DEBUG_ARTIFACTS: "1"
+          INPUT_SHEET_NAME: "Input"
+          OUTPUT_SHEET_NAME: "Retailer Results"
+        
+        run: |
+          python monitor_retailers.py
+      
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: html-debug-${{ matrix.retailer }}
+          path: /tmp/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
