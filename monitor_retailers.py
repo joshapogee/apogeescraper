@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Apogee Retailer Monitor - Enhanced Version
-Scrapes reviews/ratings from multiple audio retailers
+Apogee Retailer Monitor - Enhanced Version with Better Error Handling
 """
 
 import os
@@ -12,6 +11,7 @@ import json
 import time
 import random
 import logging
+import sys
 from typing import Dict, Any, List, Optional
 from urllib.parse import urlparse
 from pathlib import Path
@@ -204,7 +204,7 @@ def fetch_with_playwright(url: str, config: Dict):
         # Navigate
         timeout_ms = int(config["SCRAPE_TIMEOUT"] * 1000)
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        page.wait_for_timeout(1500)  # Let JS render
+        page.wait_for_timeout(1500)
         
         html = page.content()
         return html, 200, p, (browser, context, page)
@@ -255,7 +255,6 @@ def extract_jsonld(soup: BeautifulSoup) -> Dict[str, Any]:
                 if not isinstance(item, dict):
                     continue
                 
-                # Check for aggregateRating
                 agg = item.get("aggregateRating", {})
                 if isinstance(agg, dict):
                     if agg.get("ratingValue"):
@@ -267,7 +266,6 @@ def extract_jsonld(soup: BeautifulSoup) -> Dict[str, Any]:
                         if not result["review_count"]:
                             result["review_count"] = result["total_ratings"]
                 
-                # Sometimes reviewCount is at top level
                 if item.get("reviewCount"):
                     result["review_count"] = _safe_int(item.get("reviewCount"))
                     
@@ -285,12 +283,10 @@ def parse_rating_text(text: str) -> Dict[str, Any]:
     """Extract rating and count from text using regex"""
     result = {"avg_rating": None, "total_ratings": None, "review_count": None}
     
-    # Match patterns like "4.5 out of 5" or "4.5/5"
     rating_match = re.search(r"(\d+\.?\d*)\s*(?:out of|\/)\s*5", text, re.I)
     if rating_match:
         result["avg_rating"] = _safe_float(rating_match.group(1))
     
-    # Match patterns like "(123 reviews)" or "123 ratings"
     count_match = re.search(r"(\d+(?:,\d+)?)\s*(?:review|rating)", text, re.I)
     if count_match:
         count = _safe_int(count_match.group(1))
@@ -314,10 +310,9 @@ def wait_for_element(page, selectors: List[str], max_attempts: int = 10):
 
 def parse_sweetwater(page_or_html) -> Dict[str, Any]:
     """Parse Sweetwater product page"""
-    if hasattr(page_or_html, 'content'):  # Playwright page
+    if hasattr(page_or_html, 'content'):
         page = page_or_html
         
-        # Try clicking reviews tab
         try:
             tab = page.locator("text=/reviews/i").first
             if tab.count() > 0:
@@ -326,7 +321,6 @@ def parse_sweetwater(page_or_html) -> Dict[str, Any]:
         except:
             pass
         
-        # Look for rating elements
         el = wait_for_element(page, [
             "[data-qa='rating-summary']",
             ".review-summary",
@@ -340,7 +334,6 @@ def parse_sweetwater(page_or_html) -> Dict[str, Any]:
             if result["avg_rating"] or result["total_ratings"]:
                 return result
         
-        # Fallback to full page
         html = page.content()
     else:
         html = page_or_html
@@ -349,7 +342,6 @@ def parse_sweetwater(page_or_html) -> Dict[str, Any]:
     result = extract_jsonld(soup)
     
     if not (result["avg_rating"] or result["total_ratings"]):
-        # Try finding in page text
         text_result = parse_rating_text(html)
         result.update(text_result)
     
@@ -357,7 +349,7 @@ def parse_sweetwater(page_or_html) -> Dict[str, Any]:
 
 def parse_guitarcenter(page_or_html) -> Dict[str, Any]:
     """Parse Guitar Center product page"""
-    if hasattr(page_or_html, 'content'):  # Playwright page
+    if hasattr(page_or_html, 'content'):
         page = page_or_html
         
         el = wait_for_element(page, [
@@ -530,9 +522,7 @@ def scrape_product(url: str, config: Dict, retailer: str, product: str) -> Dict[
     log.debug(f"  URL: {url}")
     log.debug(f"  Mode: {'Playwright' if use_pw else 'Requests'}")
     
-    # Try with specified method
     if use_pw and parser:
-        # Playwright with custom parser
         html, code, p, handles = fetch_with_playwright(url, config)
         try:
             if handles:
@@ -543,7 +533,6 @@ def scrape_product(url: str, config: Dict, retailer: str, product: str) -> Dict[
                     log.info(f"  ✓ Found: {result['avg_rating']} stars, {result['total_ratings']} reviews")
                     return result
             
-            # Fallback to JSON-LD on rendered HTML
             if html:
                 soup = BeautifulSoup(html, "lxml")
                 result = extract_jsonld(soup)
@@ -551,14 +540,12 @@ def scrape_product(url: str, config: Dict, retailer: str, product: str) -> Dict[
                     log.info(f"  ✓ Found via JSON-LD: {result['avg_rating']} stars")
                     return result
         finally:
-            # Save artifact if failed
             if config["DEBUG_ARTIFACTS"] and html:
                 if not (result.get("avg_rating") or result.get("total_ratings")):
                     save_artifact(html, retailer, product)
             close_playwright(p, handles)
     
     else:
-        # Try requests first
         html, code = fetch_with_requests(url, config)
         
         if html:
@@ -569,14 +556,12 @@ def scrape_product(url: str, config: Dict, retailer: str, product: str) -> Dict[
                 log.info(f"  ✓ Found: {result['avg_rating']} stars, {result['total_ratings']} reviews")
                 return result
             
-            # Try parser on HTML
             if parser:
                 result = parser(html)
                 if result.get("avg_rating") or result.get("total_ratings"):
                     log.info(f"  ✓ Found: {result['avg_rating']} stars")
                     return result
         
-        # Fallback to Playwright
         if HAVE_PW:
             log.debug("  Falling back to Playwright...")
             html, code, p, handles = fetch_with_playwright(url, config)
@@ -615,42 +600,106 @@ def save_artifact(html: str, retailer: str, product: str):
         log.warning(f"Failed to save artifact: {e}")
 
 # --------------------------------------------------------------------------------------
-# Google Sheets
+# Google Sheets - IMPROVED ERROR HANDLING
 # --------------------------------------------------------------------------------------
 
 def connect_sheets() -> tuple[gspread.Client, gspread.Spreadsheet]:
-    """Connect to Google Sheets"""
+    """Connect to Google Sheets with detailed error messages"""
+    log.info("Attempting to connect to Google Sheets...")
+    
+    # Check if secret exists
     sa_json = os.getenv("GOOGLE_SA_JSON", "")
+    
+    log.info(f"GOOGLE_SA_JSON environment variable status:")
+    log.info(f"  - Exists: {bool(sa_json)}")
+    log.info(f"  - Length: {len(sa_json) if sa_json else 0} characters")
+    
     if not sa_json:
-        raise ValueError("GOOGLE_SA_JSON not set")
+        log.error("❌ GOOGLE_SA_JSON is not set or is empty!")
+        log.error("Please check:")
+        log.error("  1. GitHub repo → Settings → Secrets → Actions")
+        log.error("  2. Verify 'GOOGLE_SA_JSON' secret exists")
+        log.error("  3. Make sure you pasted the ENTIRE JSON file contents")
+        sys.exit(1)
     
+    # Try to parse JSON
     try:
+        log.info("Attempting to parse GOOGLE_SA_JSON as JSON...")
         creds = json.loads(sa_json)
-    except:
-        raise ValueError("GOOGLE_SA_JSON is not valid JSON")
+        log.info("✓ Successfully parsed JSON")
+        
+        # Validate it looks like a service account
+        if "type" not in creds:
+            log.error("❌ JSON doesn't have 'type' field - not a valid service account JSON")
+            sys.exit(1)
+        
+        if creds.get("type") != "service_account":
+            log.error(f"❌ JSON type is '{creds.get('type')}' but should be 'service_account'")
+            sys.exit(1)
+        
+        log.info(f"✓ Service account email: {creds.get('client_email', 'NOT FOUND')}")
+        
+    except json.JSONDecodeError as e:
+        log.error("❌ GOOGLE_SA_JSON is not valid JSON!")
+        log.error(f"JSON parsing error: {e}")
+        log.error("Make sure you copied the ENTIRE JSON file, including { and }")
+        sys.exit(1)
     
-    gc = gspread.service_account_from_dict(creds)
+    # Try to authenticate
+    try:
+        log.info("Authenticating with Google Sheets API...")
+        gc = gspread.service_account_from_dict(creds)
+        log.info("✓ Successfully authenticated")
+    except Exception as e:
+        log.error(f"❌ Failed to authenticate: {e}")
+        sys.exit(1)
     
+    # Get sheet ID
     sheet_id = os.getenv("SHEET_ID", "")
-    if not sheet_id:
-        raise ValueError("SHEET_ID not set")
+    log.info(f"SHEET_ID: {sheet_id if sheet_id else 'NOT SET'}")
     
-    ss = gc.open_by_key(sheet_id)
-    return gc, ss
+    if not sheet_id:
+        log.error("❌ SHEET_ID is not set!")
+        log.error("Please add SHEET_ID to GitHub secrets")
+        sys.exit(1)
+    
+    # Try to open sheet
+    try:
+        log.info(f"Opening spreadsheet: {sheet_id}")
+        ss = gc.open_by_key(sheet_id)
+        log.info(f"✓ Successfully opened sheet: {ss.title}")
+        return gc, ss
+    except Exception as e:
+        log.error(f"❌ Failed to open spreadsheet: {e}")
+        log.error("Please check:")
+        log.error(f"  1. Sheet ID is correct: {sheet_id}")
+        log.error(f"  2. Service account email has Editor access to the sheet")
+        log.error(f"     Email: {creds.get('client_email')}")
+        sys.exit(1)
 
 def read_input(ss: gspread.Spreadsheet) -> pd.DataFrame:
     """Read input data from sheet"""
     input_tab = os.getenv("INPUT_SHEET_NAME", "Input")
-    ws = ss.worksheet(input_tab)
+    
+    try:
+        ws = ss.worksheet(input_tab)
+    except Exception as e:
+        log.error(f"❌ Could not find '{input_tab}' tab in spreadsheet")
+        log.error(f"Error: {e}")
+        log.error(f"Available sheets: {[ws.title for ws in ss.worksheets()]}")
+        sys.exit(1)
     
     df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
     df = df.dropna(how="all", axis=0).dropna(how="all", axis=1)
     
     # Validate columns
     required = ["retailer", "product_name", "url"]
-    for col in required:
-        if col not in df.columns:
-            raise ValueError(f"Input sheet missing column: {col}")
+    missing = [col for col in required if col not in df.columns]
+    
+    if missing:
+        log.error(f"❌ Input sheet missing required columns: {missing}")
+        log.error(f"Found columns: {list(df.columns)}")
+        sys.exit(1)
     
     return df
 
@@ -661,13 +710,12 @@ def write_results(ss: gspread.Spreadsheet, results: List[Dict]):
     try:
         ws = ss.worksheet(output_tab)
     except:
+        log.info(f"Creating new sheet: {output_tab}")
         ws = ss.add_worksheet(output_tab, rows=1000, cols=20)
     
-    # Get existing data
     existing = get_as_dataframe(ws, evaluate_formulas=False, header=0)
     existing = existing.dropna(how="all", axis=0).dropna(how="all", axis=1)
     
-    # Prepare new data
     new_df = pd.DataFrame(results)
     
     cols = [
@@ -681,7 +729,6 @@ def write_results(ss: gspread.Spreadsheet, results: List[Dict]):
             new_df[col] = None
     new_df = new_df[cols]
     
-    # Combine
     if existing.empty:
         final_df = new_df
     else:
@@ -691,7 +738,6 @@ def write_results(ss: gspread.Spreadsheet, results: List[Dict]):
         existing = existing[cols]
         final_df = pd.concat([existing, new_df], ignore_index=True)
     
-    # Write back
     ws.clear()
     set_with_dataframe(ws, final_df, include_index=False, include_column_header=True)
     log.info(f"✓ Wrote {len(results)} results to '{output_tab}'")
@@ -702,24 +748,22 @@ def write_results(ss: gspread.Spreadsheet, results: List[Dict]):
 
 def main():
     """Main execution"""
-    log.info("=" * 60)
+    log.info("=" * 70)
     log.info("Apogee Retailer Monitor Starting")
-    log.info("=" * 60)
+    log.info("=" * 70)
     
-    # Load config
     config = load_config()
-    log.info(f"Config: {json.dumps(config, indent=2)}")
+    log.info(f"Configuration:")
+    for key, value in config.items():
+        if key not in ["USER_AGENT"]:  # Don't log long UA string
+            log.info(f"  {key}: {value}")
     
-    # Connect to sheets
-    log.info("Connecting to Google Sheets...")
     gc, ss = connect_sheets()
     
-    # Read input
     log.info("Reading input data...")
     df = read_input(ss)
     log.info(f"Total products in sheet: {len(df)}")
     
-    # Filter by retailer
     retailer_filter = config["RETAILER_FILTER"]
     if retailer_filter:
         df = filter_by_retailer(df, retailer_filter)
@@ -729,7 +773,6 @@ def main():
         log.warning("No products to process. Exiting.")
         return
     
-    # Process each product
     results = []
     
     for idx, row in df.iterrows():
@@ -747,13 +790,11 @@ def main():
             })
             continue
         
-        # Polite delay
         if idx > 0:
             delay = human_delay(config["REQUEST_DELAY"], config["JITTER"])
             log.info(f"Waiting {delay:.1f}s...")
             time.sleep(delay)
         
-        # Scrape
         try:
             data = scrape_product(url, config, retailer, product)
             
@@ -791,16 +832,14 @@ def main():
                 "notes": f"Exception: {str(e)[:200]}"
             })
     
-    # Write results
     if results:
         log.info("Writing results to sheet...")
         write_results(ss, results)
     
-    # Summary
     success = sum(1 for r in results if r["status"] == "ok")
-    log.info("=" * 60)
+    log.info("=" * 70)
     log.info(f"Complete! {success}/{len(results)} successful")
-    log.info("=" * 60)
+    log.info("=" * 70)
 
 if __name__ == "__main__":
     main()
