@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Apogee Retailer Monitor - Fixed Version with Better Parsing
+Apogee Retailer Monitor - Enhanced Anti-Bot Version
 """
 
 import os
@@ -31,19 +31,11 @@ try:
 except Exception:
     HAVE_PW = False
 
-# --------------------------------------------------------------------------------------
-# Logging
-# --------------------------------------------------------------------------------------
-
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)-7s | %(message)s",
 )
 log = logging.getLogger("apogee-monitor")
-
-# --------------------------------------------------------------------------------------
-# Utilities
-# --------------------------------------------------------------------------------------
 
 def _normalize(s: str) -> str:
     return (s or "").strip().lower()
@@ -63,7 +55,6 @@ def _safe_float(x: Any) -> Optional[float]:
             return None
         s = str(x).replace(",", "").strip()
         val = float(s)
-        # Sanity check for ratings (should be 0-5)
         if val > 5.0:
             return None
         return val
@@ -78,12 +69,7 @@ def slugify(s: str) -> str:
 def human_delay(base: float = 3.0, jitter: float = 0.8) -> float:
     return max(0.5, base + random.uniform(-jitter, jitter))
 
-# --------------------------------------------------------------------------------------
-# Configuration
-# --------------------------------------------------------------------------------------
-
 def filter_by_retailer(df: pd.DataFrame, token: str) -> pd.DataFrame:
-    """Filter dataframe by retailer token with aliases"""
     if not token:
         return df
     
@@ -107,7 +93,6 @@ def filter_by_retailer(df: pd.DataFrame, token: str) -> pd.DataFrame:
     return df[df.apply(matches, axis=1)].reset_index(drop=True)
 
 def load_config() -> Dict[str, Any]:
-    """Load runtime configuration from environment"""
     return {
         "USER_AGENT": os.getenv("USER_AGENT", 
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -121,12 +106,7 @@ def load_config() -> Dict[str, Any]:
         "RETAILER_FILTER": os.getenv("RETAILER_FILTER", ""),
     }
 
-# --------------------------------------------------------------------------------------
-# Fetching
-# --------------------------------------------------------------------------------------
-
 def create_session(user_agent: str) -> requests.Session:
-    """Create configured requests session with retries"""
     session = requests.Session()
     session.headers.update({
         "User-Agent": user_agent,
@@ -135,7 +115,10 @@ def create_session(user_agent: str) -> requests.Session:
         "Accept-Encoding": "gzip, deflate, br",
         "DNT": "1",
         "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1"
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none"
     })
     
     retry = Retry(
@@ -150,7 +133,6 @@ def create_session(user_agent: str) -> requests.Session:
     return session
 
 def fetch_with_requests(url: str, config: Dict) -> tuple[str, int]:
-    """Fetch page with requests library"""
     try:
         session = create_session(config["USER_AGENT"])
         response = session.get(url, timeout=config["SCRAPE_TIMEOUT"], allow_redirects=True)
@@ -159,7 +141,8 @@ def fetch_with_requests(url: str, config: Dict) -> tuple[str, int]:
             return "", response.status_code
         
         html = response.text
-        if len(html) < 500 or any(x in html.lower() for x in ["cloudflare", "captcha", "access denied", "checking your browser"]):
+        if len(html) < 500 or any(x in html.lower() for x in ["cloudflare", "captcha", "access denied", "checking your browser", "press & hold"]):
+            log.warning("Bot detection detected in requests response")
             return "", response.status_code
         
         return html, response.status_code
@@ -168,46 +151,136 @@ def fetch_with_requests(url: str, config: Dict) -> tuple[str, int]:
         return "", 0
 
 def fetch_with_playwright(url: str, config: Dict):
-    """Fetch page with Playwright browser"""
+    """Enhanced Playwright with aggressive anti-bot tactics"""
     if not HAVE_PW:
         return "", 0, None, None
     
     try:
         p = sync_playwright().start()
+        
+        # Launch with more stealth args
         browser = p.chromium.launch(
             headless=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-gpu",
-                "--disable-dev-shm-usage"
+                "--disable-dev-shm-usage",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-setuid-sandbox"
             ]
         )
         
+        # Create context with realistic settings
         context = browser.new_context(
             user_agent=config["USER_AGENT"],
             viewport={"width": 1920, "height": 1080},
             java_script_enabled=True,
+            locale="en-US",
+            timezone_id="America/New_York",
+            permissions=["geolocation"],
+            geolocation={"latitude": 40.7128, "longitude": -74.0060},  # NYC
+            color_scheme="light",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none"
+            }
         )
         
         page = context.new_page()
         
+        # Enhanced stealth script
         page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+            // Remove webdriver property
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+            
+            // Mock plugins
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+            
+            // Mock languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+            
+            // Mock hardware concurrency
+            Object.defineProperty(navigator, 'hardwareConcurrency', {
+                get: () => 8
+            });
+            
+            // Mock device memory
+            Object.defineProperty(navigator, 'deviceMemory', {
+                get: () => 8
+            });
+            
+            // Override permissions
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+            
+            // Mock Chrome runtime
+            window.chrome = {
+                runtime: {}
+            };
         """)
         
+        # Don't block as many resources - might look suspicious
         page.route("**/*", lambda route, request:
-            route.abort() if request.resource_type in ("image", "media", "font")
+            route.abort() if request.resource_type in ("image", "media", "font", "stylesheet")
             else route.continue_()
         )
         
+        log.info("  Navigating to URL...")
         timeout_ms = int(config["SCRAPE_TIMEOUT"] * 1000)
+        
+        # Navigate
         page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        page.wait_for_timeout(2000)  # Increased wait for JS
+        
+        # Wait longer for bot checks
+        log.info("  Waiting for page to load (checking for bot detection)...")
+        page.wait_for_timeout(5000)  # 5 seconds
+        
+        # Simulate human behavior
+        try:
+            # Random scroll
+            for _ in range(3):
+                scroll_y = random.randint(100, 500)
+                page.evaluate(f"window.scrollBy(0, {scroll_y})")
+                page.wait_for_timeout(random.randint(500, 1500))
+            
+            # Scroll back up
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_timeout(1000)
+            
+            # Move mouse randomly (helps with some bot detectors)
+            page.mouse.move(random.randint(100, 500), random.randint(100, 500))
+            page.wait_for_timeout(500)
+            
+        except Exception as e:
+            log.debug(f"Human simulation error: {e}")
+        
+        # Wait a bit more
+        page.wait_for_timeout(2000)
         
         html = page.content()
+        
+        # Check if we're still on a bot check page
+        if any(x in html.lower() for x in ["press & hold", "verifying you are human", "checking your browser", "challenge"]):
+            log.warning("  ⚠️  Bot detection still present after waits")
+        
         return html, 200, p, (browser, context, page)
         
     except PWTimeout:
@@ -218,7 +291,6 @@ def fetch_with_playwright(url: str, config: Dict):
         return "", 0, None, None
 
 def close_playwright(p, handles):
-    """Safely close Playwright resources"""
     try:
         if handles:
             browser, context, page = handles
@@ -235,19 +307,9 @@ def close_playwright(p, handles):
     except:
         pass
 
-# --------------------------------------------------------------------------------------
-# Parsing - FIXED REGEX PATTERNS
-# --------------------------------------------------------------------------------------
-
 def extract_rating_and_count(text: str) -> Dict[str, Any]:
-    """
-    Extract rating and count with STRICT patterns to avoid false matches.
-    
-    CRITICAL: Rating must come BEFORE count to avoid parsing count as rating.
-    """
     result = {"avg_rating": None, "total_ratings": None, "review_count": None}
     
-    # Pattern 1: "4.5 out of 5" or "4.5 out of 5 stars" (most specific)
     rating_match = re.search(r'\b(\d+(?:\.\d+)?)\s+out\s+of\s+5', text, re.I)
     if rating_match:
         rating = _safe_float(rating_match.group(1))
@@ -255,7 +317,6 @@ def extract_rating_and_count(text: str) -> Dict[str, Any]:
             result["avg_rating"] = rating
             log.debug(f"Found rating via 'X out of 5': {rating}")
     
-    # Pattern 2: "4.5/5" or "4.5 / 5"
     if not result["avg_rating"]:
         rating_match = re.search(r'\b(\d+(?:\.\d+)?)\s*/\s*5\b', text, re.I)
         if rating_match:
@@ -264,9 +325,7 @@ def extract_rating_and_count(text: str) -> Dict[str, Any]:
                 result["avg_rating"] = rating
                 log.debug(f"Found rating via 'X/5': {rating}")
     
-    # Pattern 3: Star rating in specific contexts (be very careful)
     if not result["avg_rating"]:
-        # Look for patterns like "Rating: 4.5" or "4.5 stars"
         rating_match = re.search(r'\b(?:rating|rated|score):\s*(\d+(?:\.\d+)?)', text, re.I)
         if rating_match:
             rating = _safe_float(rating_match.group(1))
@@ -274,8 +333,6 @@ def extract_rating_and_count(text: str) -> Dict[str, Any]:
                 result["avg_rating"] = rating
                 log.debug(f"Found rating via 'Rating: X': {rating}")
     
-    # Count patterns - look for explicit review/rating counts
-    # Pattern 1: "(123 reviews)" or "(123 ratings)"
     count_match = re.search(r'\((\d+(?:,\d+)?)\s+(?:review|rating)s?\)', text, re.I)
     if count_match:
         count = _safe_int(count_match.group(1))
@@ -284,7 +341,6 @@ def extract_rating_and_count(text: str) -> Dict[str, Any]:
             result["review_count"] = count
             log.debug(f"Found count via '(X reviews)': {count}")
     
-    # Pattern 2: "123 reviews" or "123 ratings" (not in parentheses)
     if not result["total_ratings"]:
         count_match = re.search(r'\b(\d+(?:,\d+)?)\s+(?:review|rating)s?\b', text, re.I)
         if count_match:
@@ -296,12 +352,7 @@ def extract_rating_and_count(text: str) -> Dict[str, Any]:
     
     return result
 
-# --------------------------------------------------------------------------------------
-# Parsing - JSON-LD
-# --------------------------------------------------------------------------------------
-
 def extract_jsonld(soup: BeautifulSoup) -> Dict[str, Any]:
-    """Extract ratings from JSON-LD structured data"""
     result = {
         "avg_rating": None,
         "total_ratings": None,
@@ -317,7 +368,6 @@ def extract_jsonld(soup: BeautifulSoup) -> Dict[str, Any]:
                 if not isinstance(item, dict):
                     continue
                 
-                # Check for Product with aggregateRating
                 agg = item.get("aggregateRating", {})
                 if isinstance(agg, dict):
                     if agg.get("ratingValue"):
@@ -343,12 +393,7 @@ def extract_jsonld(soup: BeautifulSoup) -> Dict[str, Any]:
     
     return result
 
-# --------------------------------------------------------------------------------------
-# Parsing - Retailer-specific with Playwright
-# --------------------------------------------------------------------------------------
-
-def wait_for_element(page, selectors: List[str], max_attempts: int = 15):
-    """Wait for any selector to appear - increased attempts"""
+def wait_for_element(page, selectors: List[str], max_attempts: int = 20):
     for attempt in range(max_attempts):
         for sel in selectors:
             try:
@@ -358,25 +403,22 @@ def wait_for_element(page, selectors: List[str], max_attempts: int = 15):
                     return el
             except:
                 pass
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(500)
     return None
 
 def parse_sweetwater(page_or_html) -> Dict[str, Any]:
-    """Parse Sweetwater - they use data attributes"""
     if hasattr(page_or_html, 'content'):
         page = page_or_html
         
-        # Try clicking reviews tab
         try:
             tabs = page.locator("button, a").filter(has_text=re.compile(r"reviews?", re.I))
             if tabs.count() > 0:
                 tabs.first.click()
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(2000)
                 log.debug("Clicked reviews tab")
         except:
             pass
         
-        # Look for rating summary
         el = wait_for_element(page, [
             "[data-qa='rating-summary']",
             "[class*='rating-summary']",
@@ -404,18 +446,15 @@ def parse_sweetwater(page_or_html) -> Dict[str, Any]:
     return result
 
 def parse_guitarcenter(page_or_html) -> Dict[str, Any]:
-    """Parse Guitar Center - uses Bazaarvoice reviews"""
     if hasattr(page_or_html, 'content'):
         page = page_or_html
         
-        # Scroll to reviews section to trigger JS
         try:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(3000)
         except:
             pass
         
-        # GC uses BV (Bazaarvoice) components
         el = wait_for_element(page, [
             "[class*='BVRRRatingSummary']",
             "[id*='BVRRSummaryContainer']",
@@ -427,7 +466,6 @@ def parse_guitarcenter(page_or_html) -> Dict[str, Any]:
         
         if el:
             html = el.inner_html()
-            log.debug(f"GC rating HTML snippet: {html[:200]}")
             result = extract_rating_and_count(html)
             if result["avg_rating"] or result["total_ratings"]:
                 return result
@@ -435,9 +473,6 @@ def parse_guitarcenter(page_or_html) -> Dict[str, Any]:
         html = page.content()
     else:
         html = page_or_html
-    
-    # Save snippet for debugging
-    log.debug(f"GC full HTML length: {len(html)}")
     
     soup = BeautifulSoup(html, "lxml")
     result = extract_jsonld(soup)
@@ -448,14 +483,12 @@ def parse_guitarcenter(page_or_html) -> Dict[str, Any]:
     return result
 
 def parse_bh(page_or_html) -> Dict[str, Any]:
-    """Parse B&H Photo"""
     if hasattr(page_or_html, 'content'):
         page = page_or_html
         
-        # Scroll to reviews
         try:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(2000)
         except:
             pass
         
@@ -486,7 +519,6 @@ def parse_bh(page_or_html) -> Dict[str, Any]:
     return result
 
 def parse_vintageking(page_or_html) -> Dict[str, Any]:
-    """Parse Vintage King"""
     if hasattr(page_or_html, 'content'):
         page = page_or_html
         html = page.content()
@@ -497,9 +529,8 @@ def parse_vintageking(page_or_html) -> Dict[str, Any]:
     result = extract_jsonld(soup)
     
     if not (result["avg_rating"] or result["total_ratings"]):
-        # Look for specific VK elements
         rating_divs = soup.find_all(['div', 'span'], class_=re.compile(r'rating|review', re.I))
-        for div in rating_divs[:5]:  # Check first 5
+        for div in rating_divs[:5]:
             text = div.get_text()
             parsed = extract_rating_and_count(text)
             if parsed["avg_rating"] or parsed["total_ratings"]:
@@ -509,7 +540,6 @@ def parse_vintageking(page_or_html) -> Dict[str, Any]:
     return result
 
 def parse_thomann(page_or_html) -> Dict[str, Any]:
-    """Parse Thomann"""
     if hasattr(page_or_html, 'content'):
         page = page_or_html
         
@@ -539,7 +569,6 @@ def parse_thomann(page_or_html) -> Dict[str, Any]:
     return result
 
 def parse_apple(page_or_html) -> Dict[str, Any]:
-    """Parse Apple App Store"""
     if hasattr(page_or_html, 'content'):
         html = page_or_html.content()
     else:
@@ -554,7 +583,6 @@ def parse_apple(page_or_html) -> Dict[str, Any]:
     return result
 
 def parse_yelp(page_or_html) -> Dict[str, Any]:
-    """Parse Yelp"""
     if hasattr(page_or_html, 'content'):
         html = page_or_html.content()
     else:
@@ -568,12 +596,7 @@ def parse_yelp(page_or_html) -> Dict[str, Any]:
     
     return result
 
-# --------------------------------------------------------------------------------------
-# Main scraper dispatcher
-# --------------------------------------------------------------------------------------
-
 def get_domain(url: str) -> str:
-    """Extract domain from URL"""
     try:
         domain = urlparse(url).netloc.lower()
         return domain[4:] if domain.startswith("www.") else domain
@@ -581,7 +604,6 @@ def get_domain(url: str) -> str:
         return ""
 
 def get_parser(url: str):
-    """Return appropriate parser function for URL"""
     domain = get_domain(url)
     
     if "sweetwater.com" in domain:
@@ -602,7 +624,6 @@ def get_parser(url: str):
     return None
 
 def scrape_product(url: str, config: Dict, retailer: str, product: str) -> Dict[str, Any]:
-    """Main scraping function with fallback logic"""
     parser = get_parser(url)
     use_pw = config["USE_PLAYWRIGHT"] == 1 and HAVE_PW
     
@@ -610,7 +631,6 @@ def scrape_product(url: str, config: Dict, retailer: str, product: str) -> Dict[
     log.debug(f"  URL: {url}")
     log.debug(f"  Mode: {'Playwright' if use_pw else 'Requests'}")
     
-    # Try with Playwright if enabled
     if use_pw and parser:
         html, code, p, handles = fetch_with_playwright(url, config)
         result = {}
@@ -623,7 +643,6 @@ def scrape_product(url: str, config: Dict, retailer: str, product: str) -> Dict[
                     log.info(f"  ✓ Found: rating={result.get('avg_rating')}, reviews={result.get('total_ratings')}")
                     return result
             
-            # Fallback to JSON-LD on rendered HTML
             if html:
                 soup = BeautifulSoup(html, "lxml")
                 result = extract_jsonld(soup)
@@ -631,13 +650,11 @@ def scrape_product(url: str, config: Dict, retailer: str, product: str) -> Dict[
                     log.info(f"  ✓ Found via JSON-LD: {result.get('avg_rating')} stars")
                     return result
         finally:
-            # Save artifact if debugging and nothing found
             if config["DEBUG_ARTIFACTS"] and html:
                 if not (result.get("avg_rating") or result.get("total_ratings")):
                     save_artifact(html, retailer, product)
             close_playwright(p, handles)
     
-    # Try with requests
     else:
         html, code = fetch_with_requests(url, config)
         
@@ -655,7 +672,6 @@ def scrape_product(url: str, config: Dict, retailer: str, product: str) -> Dict[
                     log.info(f"  ✓ Found: {result.get('avg_rating')} stars")
                     return result
         
-        # Fallback to Playwright
         if HAVE_PW:
             log.debug("  Falling back to Playwright...")
             html, code, p, handles = fetch_with_playwright(url, config)
@@ -681,7 +697,6 @@ def scrape_product(url: str, config: Dict, retailer: str, product: str) -> Dict[
     return {}
 
 def save_artifact(html: str, retailer: str, product: str):
-    """Save HTML for debugging"""
     try:
         artifact_dir = Path("/tmp/artifacts")
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -695,37 +710,27 @@ def save_artifact(html: str, retailer: str, product: str):
     except Exception as e:
         log.warning(f"Failed to save artifact: {e}")
 
-# --------------------------------------------------------------------------------------
-# Google Sheets
-# --------------------------------------------------------------------------------------
-
 def connect_sheets() -> tuple[gspread.Client, gspread.Spreadsheet]:
-    """Connect to Google Sheets with detailed error messages"""
-    log.info("Attempting to connect to Google Sheets...")
+    log.info("Connecting to Google Sheets...")
     
     sa_json = os.getenv("GOOGLE_SA_JSON", "")
-    
     if not sa_json:
-        log.error("❌ GOOGLE_SA_JSON is not set!")
+        log.error("❌ GOOGLE_SA_JSON not set!")
         sys.exit(1)
     
     try:
         creds = json.loads(sa_json)
-        log.info("✓ Successfully parsed JSON")
-        
         if creds.get("type") != "service_account":
-            log.error(f"❌ Invalid service account type")
+            log.error("❌ Invalid service account")
             sys.exit(1)
-        
-        log.info(f"✓ Service account: {creds.get('client_email', 'UNKNOWN')}")
-        
+        log.info(f"✓ Service account: {creds.get('client_email')}")
     except json.JSONDecodeError as e:
         log.error(f"❌ Invalid JSON: {e}")
         sys.exit(1)
     
     try:
         gc = gspread.service_account_from_dict(creds)
-        log.info("✓ Authenticated with Google")
+        log.info("✓ Authenticated")
     except Exception as e:
         log.error(f"❌ Auth failed: {e}")
         sys.exit(1)
@@ -744,7 +749,6 @@ def connect_sheets() -> tuple[gspread.Client, gspread.Spreadsheet]:
         sys.exit(1)
 
 def read_input(ss: gspread.Spreadsheet) -> pd.DataFrame:
-    """Read input data from sheet"""
     input_tab = os.getenv("INPUT_SHEET_NAME", "Input")
     
     try:
@@ -766,7 +770,6 @@ def read_input(ss: gspread.Spreadsheet) -> pd.DataFrame:
     return df
 
 def write_results(ss: gspread.Spreadsheet, results: List[Dict]):
-    """Append results to output sheet"""
     output_tab = os.getenv("OUTPUT_SHEET_NAME", "Retailer Results")
     
     try:
@@ -802,23 +805,15 @@ def write_results(ss: gspread.Spreadsheet, results: List[Dict]):
     
     ws.clear()
     set_with_dataframe(ws, final_df, include_index=False, include_column_header=True)
-    log.info(f"✓ Wrote {len(results)} results to '{output_tab}'")
-
-# --------------------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------------------
+    log.info(f"✓ Wrote {len(results)} results")
 
 def main():
-    """Main execution"""
     log.info("=" * 70)
-    log.info("Apogee Retailer Monitor - FIXED VERSION")
+    log.info("Apogee Retailer Monitor - ANTI-BOT VERSION")
     log.info("=" * 70)
     
     config = load_config()
-    log.info(f"Configuration:")
-    for key, value in config.items():
-        if key not in ["USER_AGENT"]:
-            log.info(f"  {key}: {value}")
+    log.info(f"Config: USE_PLAYWRIGHT={config['USE_PLAYWRIGHT']}, DELAY={config['REQUEST_DELAY']}")
     
     gc, ss = connect_sheets()
     
@@ -881,7 +876,7 @@ def main():
                     "product_name": product,
                     "url": url,
                     "status": "error",
-                    "notes": "No rating data found - check artifacts"
+                    "notes": "No rating data - likely bot detected"
                 })
         
         except Exception as e:
