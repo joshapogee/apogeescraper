@@ -30,11 +30,11 @@ jobs:
             request_delay: "3.5"
             scrape_timeout: "90"
           
-          # Sweetwater (needs Playwright)
+          # Sweetwater (needs Playwright + long delays)
           - retailer: "Sweetwater"
             use_playwright: "1"
-            request_delay: "4.0"
-            scrape_timeout: "90"
+            request_delay: "8.0"
+            scrape_timeout: "150"
           
           # Guitar Center (needs Playwright)
           - retailer: "GC"
